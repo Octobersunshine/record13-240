@@ -4,11 +4,13 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from typing import List, Tuple, Dict, Optional, Set
+from formula_normalizer import FormulaNormalizer
 
 
 class SimilarityDetector:
     def __init__(self, stop_words: Optional[List[str]] = None):
         self.stop_words = stop_words or []
+        self.formula_normalizer = FormulaNormalizer()
         self.vectorizer = TfidfVectorizer(
             tokenizer=self._tokenize,
             stop_words=self.stop_words,
@@ -19,12 +21,14 @@ class SimilarityDetector:
         self.question_meta: List[Dict] = []
         self.question_numbers: List[Set[str]] = []
         self.question_operators: List[Set[str]] = []
+        self.question_normalized_formula: List[str] = []
         self.tfidf_matrix = None
         self._fitted = False
         self._superscript_map = {'²': '2', '³': '3', '⁴': '4', '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9', '⁰': '0', '¹': '1'}
         self._subscript_map = {'₂': '2', '₃': '3', '₄': '4', '₅': '5', '₆': '6', '₇': '7', '₈': '8', '₉': '9', '₀': '0', '₁': '1'}
         self._number_pattern = re.compile(r'\d+\.?\d*')
         self._operator_pattern = re.compile(r'[+\-*/×÷=<>≠≤≥]')
+        self._formula_weight = 0.6
 
     def _normalize_text(self, text: str) -> str:
         normalized = text
@@ -47,23 +51,80 @@ class SimilarityDetector:
         return set(self._operator_pattern.findall(text))
 
     def _tokenize(self, text: str) -> List[str]:
-        numbers = self._number_pattern.findall(text)
-        processed = text
+        normalized = self.formula_normalizer.normalize(text)
+        formulas = self.formula_normalizer._extract_formulas(normalized)
+
+        processed = normalized
+        formula_tokens = []
+        for i, (start, end, formula) in enumerate(formulas):
+            placeholder = f' FORMULA_{i} '
+            processed = processed[:start] + placeholder + processed[end:]
+            formula_tokens.append(self._tokenize_formula(formula))
+
+        numbers = self._number_pattern.findall(processed)
         for i, num in enumerate(numbers):
             processed = processed.replace(num, f' NUM{i} ', 1)
+
         words = jieba.lcut(processed)
         result = []
         num_idx = 0
+        formula_idx = 0
+
         for w in words:
             w = w.strip()
             if not w or w in self.stop_words:
                 continue
-            if w.startswith('NUM') and num_idx < len(numbers):
+            if w.startswith('FORMULA_') and formula_idx < len(formula_tokens):
+                result.extend(formula_tokens[formula_idx])
+                formula_idx += 1
+            elif w.startswith('NUM') and num_idx < len(numbers):
                 result.append(f'NUM_{numbers[num_idx]}')
                 num_idx += 1
             else:
                 result.append(w)
         return result
+
+    def _tokenize_formula(self, formula: str) -> List[str]:
+        stripped = self.formula_normalizer._strip_formula_boundaries(formula)
+        tokens = []
+        current_token = ''
+
+        i = 0
+        while i < len(stripped):
+            char = stripped[i]
+            if char.isspace():
+                if current_token:
+                    tokens.append(current_token)
+                    current_token = ''
+                i += 1
+            elif char == '\\':
+                if current_token:
+                    tokens.append(current_token)
+                    current_token = '\\'
+                i += 1
+                while i < len(stripped) and (stripped[i].isalpha() or stripped[i] == '\\'):
+                    current_token += stripped[i]
+                    i += 1
+            elif char in '{}^_':
+                if current_token:
+                    tokens.append(current_token)
+                    current_token = ''
+                tokens.append(char)
+                i += 1
+            elif char in '+-*/=<>()[]':
+                if current_token:
+                    tokens.append(current_token)
+                    current_token = ''
+                tokens.append(char)
+                i += 1
+            else:
+                current_token += char
+                i += 1
+
+        if current_token:
+            tokens.append(current_token)
+
+        return [t for t in tokens if t.strip()]
 
     def _calculate_number_penalty(
         self,
@@ -143,6 +204,7 @@ class SimilarityDetector:
             self.question_meta.append({k: v for k, v in q.items() if k != 'text'})
             self.question_numbers.append(self._extract_numbers(q['text']))
             self.question_operators.append(self._extract_operators(q['text']))
+            self.question_normalized_formula.append(self.formula_normalizer.normalize(q['text']))
         self._rebuild_index()
 
     def add_question(self, question_id: int, text: str, **kwargs) -> None:
@@ -153,6 +215,7 @@ class SimilarityDetector:
         self.question_meta.append(kwargs)
         self.question_numbers.append(self._extract_numbers(text))
         self.question_operators.append(self._extract_operators(text))
+        self.question_normalized_formula.append(self.formula_normalizer.normalize(text))
         self._rebuild_index()
 
     def remove_question(self, question_id: int) -> bool:
@@ -164,6 +227,7 @@ class SimilarityDetector:
         self.question_meta.pop(idx)
         self.question_numbers.pop(idx)
         self.question_operators.pop(idx)
+        self.question_normalized_formula.pop(idx)
         self._rebuild_index()
         return True
 
@@ -175,6 +239,7 @@ class SimilarityDetector:
         self.question_meta[idx] = kwargs
         self.question_numbers[idx] = self._extract_numbers(text)
         self.question_operators[idx] = self._extract_operators(text)
+        self.question_normalized_formula[idx] = self.formula_normalizer.normalize(text)
         self._rebuild_index()
         return True
 
@@ -243,6 +308,7 @@ class SimilarityDetector:
         self.question_meta = []
         self.question_numbers = []
         self.question_operators = []
+        self.question_normalized_formula = []
         self.tfidf_matrix = None
         self._fitted = False
 
